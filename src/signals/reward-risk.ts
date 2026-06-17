@@ -80,6 +80,8 @@ export type RepoRewardRisk = {
     issueMultiplier: number;
     estimatedScoreIfClean: number;
     currentEstimatedScore: number;
+    competitionFactor: number;
+    freshnessFactor: number;
   };
   scoreBlockers: string[];
   riskBreakdown: {
@@ -103,6 +105,7 @@ export type RepoRewardRisk = {
   currentPreview: ScorePreviewResult;
   afterCleanupPreview: ScorePreviewResult;
   actions: RewardRiskAction[];
+  advisoryAdvice: AdvisoryAdviceItem[];
   whyThisHelps: string[];
   nextActions: string[];
   summary: string;
@@ -118,6 +121,22 @@ export type ContributorRewardRiskStrategy = {
   reasoning: string[];
   actionImpact: string[];
   nextActions: string[];
+  eligibilityGap: EligibilityGapEntry[];
+};
+
+export type AdvisoryLevel = "CRITICAL" | "WARNING" | "TIP" | "INFO";
+
+export type AdvisoryAdviceItem = {
+  level: AdvisoryLevel;
+  code: string;
+  message: string;
+};
+
+export type EligibilityGapEntry = {
+  repoFullName: string;
+  currentOpenPrCount: number;
+  openPrThreshold: number;
+  prsNeededToUnlock: number;
 };
 
 export type MaintainerNoiseReport = {
@@ -290,6 +309,8 @@ export function buildRepoRewardRisk(args: {
       issueMultiplier: currentPreview.scoreEstimate.issueMultiplier,
       estimatedScoreIfClean: afterCleanupPreview.scoreEstimate.estimatedMergedScore,
       currentEstimatedScore: currentPreview.scoreEstimate.estimatedMergedScore,
+      competitionFactor: computeCompetitionFactor(args.issues, args.pullRequests),
+      freshnessFactor: computeFreshnessFactor(args.issues),
     },
     scoreBlockers,
     riskBreakdown: {
@@ -306,6 +327,16 @@ export function buildRepoRewardRisk(args: {
     currentPreview,
     afterCleanupPreview,
     actions,
+    advisoryAdvice: buildAdvisoryAdvice({
+      lane,
+      roleContext,
+      currentPreview,
+      repo: args.repo,
+      repoOutcome,
+      currentOpenPrCount,
+      queueHealth,
+      collisionsHighRiskCount: collisions.summary.highRiskCount,
+    }),
     whyThisHelps,
     nextActions: nextActions.length > 0 ? nextActions : ["Gather fresher repo and contributor evidence before acting."],
     summary: `${args.repoFullName}: ${scoreBlockers.length > 0 ? "blocked or cautionary" : "scoreable"} private reward/risk context; top action ${actions[0]?.actionKind ?? "none"}.`,
@@ -380,6 +411,7 @@ export function buildContributorRewardRiskStrategy(args: {
     reasoning: [...new Set(reasoning)],
     actionImpact,
     nextActions: nextActions.length > 0 ? nextActions : ["Refresh official Gittensor and GitHub backfill data, then rerun strategy."],
+    eligibilityGap: buildEligibilityGap(repoAnalyses),
   };
 }
 
@@ -775,6 +807,78 @@ function maintainerNextStepsFor(action: PullRequestReviewability["action"], nois
   return ["Watch for tests, checks, linked context, or duplicate-risk changes before prioritizing review."];
 }
 
+function buildAdvisoryAdvice(args: {
+  lane: LaneAdvice;
+  roleContext: RoleContext;
+  currentPreview: ScorePreviewResult;
+  repo: RepositoryRecord | null;
+  repoOutcome: ContributorOutcomeHistory["repoOutcomes"][number] | undefined;
+  currentOpenPrCount: number;
+  queueHealth: QueueHealth;
+  collisionsHighRiskCount: number;
+}): AdvisoryAdviceItem[] {
+  const items: AdvisoryAdviceItem[] = [];
+  if (!args.repo?.isRegistered) items.push({ level: "CRITICAL", code: "unregistered_repo", message: "Repository is not registered in the local snapshot." });
+  if (args.lane.lane === "inactive") items.push({ level: "CRITICAL", code: "inactive_lane", message: "Repository allocation is inactive." });
+  if (args.lane.lane === "unknown") items.push({ level: "CRITICAL", code: "unknown_lane", message: "Repository lane is unknown." });
+  if (args.currentOpenPrCount > args.currentPreview.gates.openPrThreshold) {
+    items.push({ level: "CRITICAL", code: "open_pr_threshold_exceeded", message: `Open PR count (${args.currentOpenPrCount}) exceeds the scoring threshold (${args.currentPreview.gates.openPrThreshold}).` });
+  }
+  if (args.currentPreview.gates.credibilityObserved < args.currentPreview.gates.credibilityFloor) {
+    items.push({ level: "CRITICAL", code: "credibility_below_floor", message: `Credibility (${round(args.currentPreview.gates.credibilityObserved)}) is below the floor (${args.currentPreview.gates.credibilityFloor}).` });
+  }
+  if ((args.repoOutcome?.closedPullRequestRate ?? 0) >= 0.35) {
+    items.push({ level: "WARNING", code: "high_closed_pr_rate", message: `Closed PR rate of ${percent(args.repoOutcome?.closedPullRequestRate ?? 0)} creates credibility risk.` });
+  }
+  if (args.queueHealth.level === "critical" || args.queueHealth.level === "high") {
+    items.push({ level: "WARNING", code: "high_queue_burden", message: `Maintainer queue burden is ${args.queueHealth.level}.` });
+  }
+  if (args.collisionsHighRiskCount > 0) {
+    items.push({ level: "WARNING", code: "collision_risk", message: `${args.collisionsHighRiskCount} high-risk duplicate cluster(s) increase review friction.` });
+  }
+  if (args.roleContext.maintainerLane) {
+    items.push({ level: "TIP", code: "maintainer_lane", message: "Maintainer-lane activity is tracked separately from outside-contributor reward evidence." });
+  }
+  if (args.lane.lane === "issue_discovery") {
+    items.push({ level: "TIP", code: "issue_discovery_only", message: "This repo routes reward through issue discovery; direct PR lane value is minimal." });
+  }
+  if (args.currentOpenPrCount > 0 && args.currentOpenPrCount <= args.currentPreview.gates.openPrThreshold) {
+    items.push({ level: "INFO", code: "open_prs_within_threshold", message: `${args.currentOpenPrCount} open PR(s) are within the scoring threshold of ${args.currentPreview.gates.openPrThreshold}.` });
+  }
+  return items;
+}
+
+function computeCompetitionFactor(issues: IssueRecord[], pullRequests: PullRequestRecord[]): number {
+  const openIssues = issues.filter((issue) => issue.state === "open");
+  if (openIssues.length === 0) return 1;
+  const linkedIssueNumbers = new Set(pullRequests.filter((pr) => pr.state === "open").flatMap((pr) => pr.linkedIssues));
+  const competedCount = openIssues.filter((issue) => linkedIssueNumbers.has(issue.number)).length;
+  return round(clamp(1 - competedCount / openIssues.length, 0, 1));
+}
+
+function computeFreshnessFactor(issues: IssueRecord[]): number {
+  const openWithDate = issues.filter((issue) => issue.state === "open" && issue.createdAt);
+  if (openWithDate.length === 0) return 0.5;
+  const nowMs = Date.now();
+  const ages = openWithDate
+    .map((issue) => (nowMs - new Date(issue.createdAt!).getTime()) / (1000 * 60 * 60 * 24))
+    .sort((a, b) => a - b);
+  const medianAge = ages[Math.floor(ages.length / 2)] ?? 0;
+  return round(clamp(Math.exp(-medianAge / 90), 0, 1));
+}
+
+function buildEligibilityGap(repoAnalyses: RepoRewardRisk[]): EligibilityGapEntry[] {
+  return repoAnalyses
+    .map((analysis) => ({
+      repoFullName: analysis.repoFullName,
+      currentOpenPrCount: analysis.riskBreakdown.openPullRequests,
+      openPrThreshold: analysis.currentPreview.gates.openPrThreshold,
+      prsNeededToUnlock: Math.max(0, analysis.riskBreakdown.openPullRequests - analysis.currentPreview.gates.openPrThreshold),
+    }))
+    .filter((entry) => entry.prsNeededToUnlock > 0 && entry.prsNeededToUnlock <= 5)
+    .sort((a, b) => a.prsNeededToUnlock - b.prsNeededToUnlock || a.repoFullName.localeCompare(b.repoFullName));
+}
+
 function sameRepo(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
 }
@@ -808,3 +912,12 @@ function round(value: number): number {
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
+
+export const __rewardRiskInternals = {
+  buildAdvisoryAdvice,
+  computeCompetitionFactor,
+  computeFreshnessFactor,
+  buildEligibilityGap,
+  round,
+  clamp,
+};

@@ -50,6 +50,7 @@ import {
 import { loadIssueQualityReportMap } from "./issue-quality";
 import { loadRepoOutcomePatternsMap } from "./repo-outcome-patterns";
 import { evaluateRecommendationOutcomes } from "./recommendation-outcomes";
+import type { AdvisoryAdviceItem, EligibilityGapEntry } from "../signals/reward-risk";
 import type {
   BountyRecord,
   AgentRecommendationOutcomeRepoSummary,
@@ -132,6 +133,8 @@ export type ContributorDecisionPack = {
   summary: string;
   nextActions: string[];
   openPrMonitor?: ContributorOpenPrMonitor | undefined;
+  advisoryAdvice: AdvisoryAdviceItem[];
+  eligibilityGapRepos: EligibilityGapEntry[];
 };
 
 export type DecisionPackRefreshNeeded = {
@@ -659,6 +662,8 @@ function buildContributorDecisionPack(args: {
     summary: `${args.login} has ${topActions.length} ranked action(s), ${scoreBlockers.length} scoreability blocker(s), and ${repoDecisions.length} registered repo decision(s).${monitorSummary}${recommendationFeedbackSummary(recommendationOutcomeFeedback)}`,
     nextActions: packNextActions,
     openPrMonitor: monitor,
+    advisoryAdvice: buildDecisionPackAdvisoryAdvice(scoreBlockers),
+    eligibilityGapRepos: buildDecisionPackEligibilityGap(repoDecisions),
   };
 }
 
@@ -1083,6 +1088,36 @@ function emptyRecommendationOutcomeFeedback(login: string): AgentRecommendationO
     maintainerLane: { total: 0, states: [] },
     privateSummary: `${login} has no evaluated recommendation outcomes in the last 90 day(s).`,
   };
+}
+
+const ADVISORY_SEVERITY_TO_LEVEL: Record<ScoreBlocker["severity"], AdvisoryAdviceItem["level"]> = {
+  critical: "CRITICAL",
+  warning: "WARNING",
+  info: "INFO",
+};
+const ADVISORY_SEVERITY_ORDER: Record<ScoreBlocker["severity"], number> = { critical: 0, warning: 1, info: 2 };
+const OPEN_PR_PRESSURE_THRESHOLD = 4;
+
+function buildDecisionPackAdvisoryAdvice(blockers: ScoreBlocker[]): AdvisoryAdviceItem[] {
+  return [...blockers]
+    .sort((a, b) => (ADVISORY_SEVERITY_ORDER[a.severity] ?? 3) - (ADVISORY_SEVERITY_ORDER[b.severity] ?? 3))
+    .slice(0, 10)
+    .map((blocker) => ({
+      level: ADVISORY_SEVERITY_TO_LEVEL[blocker.severity] ?? "INFO",
+      code: blocker.code,
+      message: blocker.detail,
+    }));
+}
+
+function buildDecisionPackEligibilityGap(decisions: RepoDecision[]): EligibilityGapEntry[] {
+  return decisions
+    .map((decision) => {
+      const currentOpenPrCount = decision.outcome?.openPullRequests ?? 0;
+      const prsNeededToUnlock = Math.max(0, currentOpenPrCount - OPEN_PR_PRESSURE_THRESHOLD);
+      return { repoFullName: decision.repoFullName, currentOpenPrCount, openPrThreshold: OPEN_PR_PRESSURE_THRESHOLD, prsNeededToUnlock };
+    })
+    .filter((entry) => entry.prsNeededToUnlock > 0 && entry.prsNeededToUnlock <= 5)
+    .sort((a, b) => a.prsNeededToUnlock - b.prsNeededToUnlock || a.repoFullName.localeCompare(b.repoFullName));
 }
 
 function scoreBlockersFor(repoFullName: string, lane: string, roleContext: RoleContext, outcome: ContributorOutcomeHistory["repoOutcomes"][number] | undefined): ScoreBlocker[] {
@@ -1789,4 +1824,6 @@ export const __decisionPackInternals = {
   sanitizeTradeoffPublicText,
   buildRepoDecisionCounterfactualReasons,
   sanitizeCounterfactualPublicText,
+  buildDecisionPackAdvisoryAdvice,
+  buildDecisionPackEligibilityGap,
 };
