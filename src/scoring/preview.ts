@@ -1,4 +1,5 @@
 import type { ContributorEvidenceRecord, JsonValue, RepositoryRecord, RepoTimeDecayOverrides, ScoringModelSnapshotRecord, ScorePreviewRecord } from "../types";
+import { DEFAULT_SCORING_CONSTANTS } from "./model";
 import { nowIso } from "../utils/json";
 
 export type ScorePreviewInput = {
@@ -283,7 +284,7 @@ function computeScoreCore(
   const config = repo?.registryConfig;
   const emissionShare = clamp(config?.emissionShare ?? 0, 0, 1);
   const issueDiscoveryShare = clamp(config?.issueDiscoveryShare ?? 0, 0, 1);
-  const ossEmissionShare = constant(constants, "OSS_EMISSION_SHARE", 0.9);
+  const ossEmissionShare = constant(constants, "OSS_EMISSION_SHARE");
   const repoSlice = emissionShare * ossEmissionShare;
   const directPrSlice = repoSlice * (1 - issueDiscoveryShare);
   const issueDiscoverySlice = repoSlice * issueDiscoveryShare;
@@ -292,14 +293,20 @@ function computeScoreCore(
   const sourceLines = Math.max(1, nonNegative(input.sourceLines ?? sourceTokenScore));
   const fixedBaseScore = input.fixedBaseScore ?? config?.fixedBaseScore ?? undefined;
   const rawDensity = sourceTokenScore / sourceLines;
-  const densityMultiplier = clamp(rawDensity || 0, 0, constant(constants, "MAX_CODE_DENSITY_MULTIPLIER", 1.15));
-  const densityTokenGatePassed = sourceTokenScore >= constant(constants, "MIN_TOKEN_SCORE_FOR_BASE_SCORE", 5);
+  // Density branch (#812): upstream is on the saturation model, but `current_density_model` is still a
+  // supported `activeModel` (types.ts union, the public OpenAPI schema, the DB parser, ~20 test fixtures, and
+  // src/services/score-breakdown.ts which keys off densityMultiplier). The issue's "if density is dead,
+  // remove the branch" condition is therefore FALSE — the branch is retained as the supported alternate /
+  // fetch-failure-`unknown` fallback model. Its fallback constants are now single-sourced from
+  // DEFAULT_SCORING_CONSTANTS (model.ts) instead of silent duplicated literals, closing the drift surface.
+  const densityMultiplier = clamp(rawDensity || 0, 0, constant(constants, "MAX_CODE_DENSITY_MULTIPLIER"));
+  const densityTokenGatePassed = sourceTokenScore >= constant(constants, "MIN_TOKEN_SCORE_FOR_BASE_SCORE");
   const baseTokenGatePassed = snapshot.activeModel === "pending_saturation_model" ? sourceTokenScore > 0 : densityTokenGatePassed;
   const densityContributionBonus = contributionBonusRamp(totalTokenScore, constants);
   const saturationContributionBonusValue = saturationContributionBonus(totalTokenScore, constants);
   const saturationBaseScore = saturationScore(sourceTokenScore, totalTokenScore, constants);
   const densityBaseScore =
-    (densityTokenGatePassed ? constant(constants, "MERGED_PR_BASE_SCORE", 25) * densityMultiplier : 0) + densityContributionBonus;
+    (densityTokenGatePassed ? constant(constants, "MERGED_PR_BASE_SCORE") * densityMultiplier : 0) + densityContributionBonus;
   const baseScore =
     fixedBaseScore !== undefined
       ? fixedBaseScore
@@ -312,17 +319,17 @@ function computeScoreCore(
   const linkedIssueMultiplier = decideLinkedIssueMultiplier(input.linkedIssueMode ?? "none", input.linkedIssueContext, constants, branchEligibility);
   const issueMultiplier = linkedIssueMultiplier.appliedMultiplier;
   const credibilityObserved = clamp(input.credibility ?? inferCredibility(contributorEvidence), 0, 1);
-  const credibilityFloor = constant(constants, "MIN_CREDIBILITY", 0.8);
+  const credibilityFloor = constant(constants, "MIN_CREDIBILITY");
   const credibilityMultiplier = credibilityObserved >= credibilityFloor ? 1 : credibilityObserved / credibilityFloor;
   const changesRequestedCount = nonNegative(input.changesRequestedCount);
-  const reviewPenaltyMultiplier = clamp(1 - changesRequestedCount * constant(constants, "REVIEW_PENALTY_RATE", 0.15), 0, 1);
+  const reviewPenaltyMultiplier = clamp(1 - changesRequestedCount * constant(constants, "REVIEW_PENALTY_RATE"), 0, 1);
   const openPrCount = nonNegative(input.openPrCount);
   // The concurrency allowance is earned from the contributor's established merged-history token
   // score; the planned PR's own tokens (totalTokenScore) must not inflate its own open-PR threshold.
   const openPrThreshold = Math.min(
-    constant(constants, "MAX_OPEN_PR_THRESHOLD", 30),
-    constant(constants, "EXCESSIVE_PR_PENALTY_BASE_THRESHOLD", 2) +
-      Math.floor(nonNegative(input.existingContributorTokenScore) / constant(constants, "OPEN_PR_THRESHOLD_TOKEN_SCORE", 300)),
+    constant(constants, "MAX_OPEN_PR_THRESHOLD"),
+    constant(constants, "EXCESSIVE_PR_PENALTY_BASE_THRESHOLD") +
+      Math.floor(nonNegative(input.existingContributorTokenScore) / constant(constants, "OPEN_PR_THRESHOLD_TOKEN_SCORE")),
   );
   const openPrMultiplier = openPrCount <= openPrThreshold ? 1 : 0;
   // Upstream time-decay (#703): mirrors upstream's `scored.time_decay_multiplier` applied to a PR's score.
@@ -361,7 +368,7 @@ function computeScoreCore(
       baseTokenGatePassed,
       openPrThreshold,
       openPrCount,
-      collateralFraction: constant(constants, "OPEN_PR_COLLATERAL_PERCENT", 0.2),
+      collateralFraction: constant(constants, "OPEN_PR_COLLATERAL_PERCENT"),
       credibilityFloor,
       credibilityObserved,
     },
@@ -840,8 +847,8 @@ function uniquePositiveInts(values: number[]): number[] {
 }
 
 function selectIssueMultiplier(mode: "none" | "standard" | "maintainer", constants: Record<string, number>): number {
-  if (mode === "maintainer") return constant(constants, "MAINTAINER_ISSUE_MULTIPLIER", 1.66);
-  if (mode === "standard") return constant(constants, "STANDARD_ISSUE_MULTIPLIER", 1.33);
+  if (mode === "maintainer") return constant(constants, "MAINTAINER_ISSUE_MULTIPLIER");
+  if (mode === "standard") return constant(constants, "STANDARD_ISSUE_MULTIPLIER");
   return 1;
 }
 
@@ -898,9 +905,17 @@ function inferCredibility(evidence?: ContributorEvidenceRecord | null): number {
   return clamp(0.75 + merged * 0.04 - stale * 0.03 - unlinked * 0.02, 0.25, 1);
 }
 
-function constant(constants: Record<string, number>, key: string, fallback: number): number {
+// Single source of truth (#812): the fallback for any constant is ALWAYS DEFAULT_SCORING_CONSTANTS — never
+// a duplicated literal at the call site. The live `constants` (snapshot.constants, which already merges
+// DEFAULT_SCORING_CONSTANTS with parsed upstream values) wins when present; otherwise the declared default
+// is used. This removes the duplicate-source-of-truth drift surface without changing any value (every
+// former call-site literal already matched its DEFAULT_SCORING_CONSTANTS entry).
+function constant(constants: Record<string, number>, key: string): number {
   const value = constants[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const fallback = DEFAULT_SCORING_CONSTANTS[key];
+  /* v8 ignore next -- defensive: every recognized key is in DEFAULT_SCORING_CONSTANTS; this guards typos/forward-compat. */
+  return typeof fallback === "number" && Number.isFinite(fallback) ? fallback : 0;
 }
 
 /**
@@ -913,10 +928,10 @@ export function resolveTimeDecay(
   overrides?: RepoTimeDecayOverrides | null,
 ): { gracePeriodHours: number; sigmoidMidpointDays: number; sigmoidSteepness: number; minMultiplier: number } {
   return {
-    gracePeriodHours: pickOverride(overrides?.gracePeriodHours, constant(constants, "TIME_DECAY_GRACE_PERIOD_HOURS", 12)),
-    sigmoidMidpointDays: pickOverride(overrides?.sigmoidMidpointDays, constant(constants, "TIME_DECAY_SIGMOID_MIDPOINT", 10)),
-    sigmoidSteepness: pickOverride(overrides?.sigmoidSteepness, constant(constants, "TIME_DECAY_SIGMOID_STEEPNESS_SCALAR", 0.4)),
-    minMultiplier: pickOverride(overrides?.minMultiplier, constant(constants, "TIME_DECAY_MIN_MULTIPLIER", 0.05)),
+    gracePeriodHours: pickOverride(overrides?.gracePeriodHours, constant(constants, "TIME_DECAY_GRACE_PERIOD_HOURS")),
+    sigmoidMidpointDays: pickOverride(overrides?.sigmoidMidpointDays, constant(constants, "TIME_DECAY_SIGMOID_MIDPOINT")),
+    sigmoidSteepness: pickOverride(overrides?.sigmoidSteepness, constant(constants, "TIME_DECAY_SIGMOID_STEEPNESS_SCALAR")),
+    minMultiplier: pickOverride(overrides?.minMultiplier, constant(constants, "TIME_DECAY_MIN_MULTIPLIER")),
   };
 }
 
@@ -941,9 +956,9 @@ export function calculateTimeDecay(prAgeHours: number, constants: Record<string,
 }
 
 function saturationScore(sourceTokenScore: number, totalTokenScore: number, constants: Record<string, number>): number {
-  const scale = Math.max(constant(constants, "SRC_TOK_SATURATION_SCALE", 58), 1);
+  const scale = Math.max(constant(constants, "SRC_TOK_SATURATION_SCALE"), 1);
   return (
-    constant(constants, "MERGED_PR_BASE_SCORE", 25) * (1 - Math.exp(-sourceTokenScore / scale)) +
+    constant(constants, "MERGED_PR_BASE_SCORE") * (1 - Math.exp(-sourceTokenScore / scale)) +
     saturationContributionBonus(totalTokenScore, constants)
   );
 }
@@ -954,11 +969,11 @@ function saturationContributionBonus(totalTokenScore: number, constants: Record<
 
 // Shared contribution-bonus ramp used by both scoring models so the saturation
 // and density bonuses cannot drift: clamp(totalTokenScore / FULL_BONUS, 0, 1)
-// scaled by MAX_CONTRIBUTION_BONUS (upstream default 5; see model.ts #807).
+// scaled by MAX_CONTRIBUTION_BONUS (upstream default 5; single-sourced in model.ts, see #807/#812).
 function contributionBonusRamp(totalTokenScore: number, constants: Record<string, number>): number {
   return (
-    clamp(totalTokenScore / constant(constants, "CONTRIBUTION_SCORE_FOR_FULL_BONUS", 1500), 0, 1) *
-    constant(constants, "MAX_CONTRIBUTION_BONUS", 5)
+    clamp(totalTokenScore / constant(constants, "CONTRIBUTION_SCORE_FOR_FULL_BONUS"), 0, 1) *
+    constant(constants, "MAX_CONTRIBUTION_BONUS")
   );
 }
 

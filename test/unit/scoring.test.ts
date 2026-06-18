@@ -845,4 +845,53 @@ MAX_CODE_DENSITY_MULTIPLIER = 1.15
       expect(buildScorePreview({ repo: repoDefault, snapshot, input }).scoreEstimate.timeDecayMultiplier).toBeLessThan(1);
     });
   });
+
+  describe("single-source fallbacks (#812)", () => {
+    it("the density-era fallback constants are declared in DEFAULT_SCORING_CONSTANTS (no longer silent literals)", () => {
+      // Previously MIN_TOKEN_SCORE_FOR_BASE_SCORE and MAX_CODE_DENSITY_MULTIPLIER existed only as hardcoded
+      // literals at preview.ts call sites — a silent fallback surface. They are now single-sourced here.
+      expect(DEFAULT_SCORING_CONSTANTS.MIN_TOKEN_SCORE_FOR_BASE_SCORE).toBe(5);
+      expect(DEFAULT_SCORING_CONSTANTS.MAX_CODE_DENSITY_MULTIPLIER).toBe(1.15);
+      // Every constant the engine looks up is a key of the single source of truth.
+      expect(DEFAULT_SCORING_CONSTANTS.MERGED_PR_BASE_SCORE).toBe(25);
+      expect(DEFAULT_SCORING_CONSTANTS.SRC_TOK_SATURATION_SCALE).toBe(58);
+    });
+
+    it("a preview with an empty constants object resolves every fallback from DEFAULT_SCORING_CONSTANTS, matching an explicit-defaults preview", () => {
+      const input: ScorePreviewInput = { repoFullName: repo.fullName, sourceTokenScore: 60, totalTokenScore: 90, sourceLines: 50, openPrCount: 0, credibility: 1 };
+      // Empty constants: every value must come from the single-sourced defaults — no call-site literals left.
+      const emptyConstants = buildScorePreview({
+        repo,
+        snapshot: { ...snapshot, activeModel: "pending_saturation_model" as const, constants: {} },
+        input,
+      });
+      // Explicit defaults: the same single source, supplied up-front.
+      const explicitDefaults = buildScorePreview({
+        repo,
+        snapshot: { ...snapshot, activeModel: "pending_saturation_model" as const, constants: { ...DEFAULT_SCORING_CONSTANTS } },
+        input,
+      });
+      // The two previews must be identical — proving the fallback source is DEFAULT_SCORING_CONSTANTS and
+      // no duplicated literal can drift away from it.
+      expect(emptyConstants.scoreEstimate).toEqual(explicitDefaults.scoreEstimate);
+      expect(emptyConstants.gates).toEqual(explicitDefaults.gates);
+      expect(emptyConstants.effectiveEstimatedScore).toBe(explicitDefaults.effectiveEstimatedScore);
+      expect(emptyConstants.effectiveEstimatedScore).toBeGreaterThan(0);
+    });
+
+    it("retains the density model branch as a supported activeModel (the #812 'if density is dead' condition is false)", () => {
+      // The density branch is NOT dead: `current_density_model` is a valid activeModel in types.ts, the public
+      // OpenAPI schema, the DB parser, ~20 test fixtures, and src/services/score-breakdown.ts. The branch is
+      // therefore retained; only its fallback constants were single-sourced.
+      const densityPreview = buildScorePreview({
+        repo,
+        snapshot: { ...snapshot, activeModel: "current_density_model" as const, constants: { ...DEFAULT_SCORING_CONSTANTS } },
+        input: { repoFullName: repo.fullName, sourceTokenScore: 60, totalTokenScore: 90, sourceLines: 50, openPrCount: 0, credibility: 1 },
+      });
+      // densityMultiplier is clamped to MAX_CODE_DENSITY_MULTIPLIER (1.15) and surfaced on the estimate.
+      expect(densityPreview.scoreEstimate.densityMultiplier).toBeGreaterThan(0);
+      expect(densityPreview.scoreEstimate.densityMultiplier).toBeLessThanOrEqual(DEFAULT_SCORING_CONSTANTS.MAX_CODE_DENSITY_MULTIPLIER!);
+      expect(densityPreview.effectiveEstimatedScore).toBeGreaterThan(0);
+    });
+  });
 });
