@@ -8119,7 +8119,10 @@
           },
           "newcomerGuideMode": {
             "type": "string",
-            "enum": ["off", "enabled"]
+            "enum": [
+              "off",
+              "enabled"
+            ]
           }
         },
         "required": [
@@ -8626,7 +8629,10 @@
               },
               "newcomerGuideMode": {
                 "type": "string",
-                "enum": ["off", "enabled"]
+                "enum": [
+                  "off",
+                  "enabled"
+                ]
               },
               "commandAuthorization": {
                 "type": "object",
@@ -8764,6 +8770,7 @@
               "createMissingLabel",
               "includeMaintainerAuthors",
               "requireLinkedIssue",
+              "newcomerGuideMode",
               "commandAuthorization"
             ]
           },
