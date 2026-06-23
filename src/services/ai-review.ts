@@ -18,8 +18,8 @@
 // are audited via `recordAiUsageEvent`.
 import { countByokAiEventsForRepoSince, recordAiUsageEvent, sumAiEstimatedNeuronsSince } from "../db/repositories";
 import { sanitizePublicComment } from "../queue-intelligence";
-import { defangReviewInput, isSafetyEnabled } from "../review/safety";
 import { isConvergenceRepoAllowed } from "../review/cutover-gate";
+import { defangReviewInput, isSafetyEnabled } from "../review/safety";
 
 /**
  * The best free Workers-AI model pair for review accuracy — two different families for independence,
@@ -90,6 +90,7 @@ export type GittensoryAiReviewInput = {
    * to today — no section is appended.
    */
   ragContext?: string | null | undefined;
+  convergedRepoAllowed?: boolean | undefined;
 };
 
 /** A consensus critical defect, already public-safe, ready to become a gate blocker finding. */
@@ -398,7 +399,8 @@ export async function runGittensoryAiReview(env: Env, input: GittensoryAiReviewI
   // Per-repo cutover gate (GITTENSORY_REVIEW_REPOS): the defang activates for THIS PR's repo only when it
   // is allowlisted AND the global safety flag is ON. Empty/unset allowlist → `input` passes through unchanged
   // for every repo (the prompt is byte-identical to today) regardless of GITTENSORY_REVIEW_SAFETY.
-  const promptInput = isSafetyEnabled(env) && isConvergenceRepoAllowed(env, input.repoFullName) ? { ...input, ...defangReviewInput(input) } : input;
+  const convergedRepoAllowed = input.convergedRepoAllowed ?? isConvergenceRepoAllowed(env, input.repoFullName);
+  const promptInput = isSafetyEnabled(env) && convergedRepoAllowed ? { ...input, ...defangReviewInput(input) } : input;
   const user = buildUserPrompt(promptInput);
   // Grounding-discipline SYSTEM suffix (convergence, flag-gated). When the caller supplied grounding, the
   // reviewers are told to verify claims against the attached CI/files; otherwise this is REVIEW_SYSTEM_PROMPT

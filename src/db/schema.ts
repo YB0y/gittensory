@@ -79,6 +79,18 @@ export const repositorySettings = sqliteTable("repository_settings", {
   updatedAt: text("updated_at").notNull().$defaultFn(() => nowIso()),
 });
 
+export const reviewCutoverControls = sqliteTable("review_cutover_controls", {
+  repoFullName: text("repo_full_name").primaryKey(),
+  stage: text("stage").notNull().default("shadow"),
+  freezeVerifiedAt: text("freeze_verified_at"),
+  freezeVerifiedBy: text("freeze_verified_by"),
+  rollbackDryRunAt: text("rollback_dry_run_at"),
+  rollbackDryRunBy: text("rollback_dry_run_by"),
+  lastLiveAt: text("last_live_at"),
+  lastRollbackAt: text("last_rollback_at"),
+  updatedAt: text("updated_at").notNull().$defaultFn(() => nowIso()),
+});
+
 // Maintainer BYOK provider keys (Anthropic/OpenAI), encrypted at rest with AES-256-GCM. Isolated in its
 // own table so the ciphertext is NEVER serialized by the repository-settings GET surface. The plaintext
 // key is never stored; `last4` is a display-only hint derived from the plaintext at write time.

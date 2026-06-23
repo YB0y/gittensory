@@ -178,6 +178,7 @@ import { loadHardGuardrailGlobs } from "../review/guardrail-config";
 import { isOpsEnabled, runOpsAlerts } from "../review/ops-wire";
 import { isSelfTuneEnabled, runSelfTune } from "../review/selftune-wire";
 import { recordNativeGateDecision } from "../review/parity-wire";
+import { isConvergenceRepoLive } from "../review/cutover-control";
 import type { SubmissionOutcome } from "../review/submitter-reputation";
 import type { AdvisoryFinding, ContributorEvidenceRecord, ContributorRepoStatRecord, DetectedNotificationEvent, GitHubWebhookPayload, IssueRecord, JobMessage, JsonValue, PullRequestFilePathRecord, PullRequestRecord, RepositoryRecord, RepositorySettings } from "../types";
 import { sha256Hex } from "../utils/crypto";
@@ -1570,15 +1571,12 @@ export async function runAiReviewForAdvisory(
     // review + grounding + RAG use these instead of re-reading the stored rows — so a review that fired before
     // detail-sync still sees the REAL diff (FIX B). Omitted (e.g. unit tests) → fall back to the stored read.
     files?: Awaited<ReturnType<typeof listPullRequestFiles>> | undefined;
+    convergedRepoAllowed?: boolean | undefined;
   },
 ): Promise<{ notes: string; reviewerCount: number } | undefined> {
   const packAllowsAnyAuthorBlockingReview = args.settings.gatePack === "oss-anti-slop" && args.settings.aiReviewMode === "block";
   if (args.settings.aiReviewMode === "off" || (!args.confirmedContributor && !packAllowsAnyAuthorBlockingReview) || !args.advisory.headSha) return undefined;
-  // Per-repo cutover gate (GITTENSORY_REVIEW_REPOS): the converged review features (reputation AI-skip,
-  // grounding, RAG) activate for THIS repo only when it is allowlisted. Computed once and ANDed into each
-  // feature's global flag below. Empty/unset allowlist → false → every converged branch here is unreachable
-  // (byte-identical to today) regardless of the global flags.
-  const convergedRepoAllowed = isConvergenceRepoAllowed(env, args.repoFullName);
+  const convergedRepoAllowed = args.convergedRepoAllowed ?? isConvergenceRepoAllowed(env, args.repoFullName);
   // Reputation anti-abuse (convergence, flag-gated by GITTENSORY_REVIEW_REPUTATION). Extends the AI-spend gate above:
   // an INTERNAL low-reputation / burst / new submitter is downgraded to a DETERMINISTIC-ONLY review — the
   // (paid) AI neurons are skipped here exactly as they are for an unconfirmed contributor, so a serial abuser
@@ -1632,6 +1630,7 @@ export async function runAiReviewForAdvisory(
       actor: args.author,
       mode: args.settings.aiReviewMode === "block" ? "block" : "advisory",
       providerKey,
+      convergedRepoAllowed,
       grounding,
       ragContext,
     });
@@ -1668,12 +1667,14 @@ export async function maybeAddSecretLeakFinding(
     repoFullName: string;
     pullNumber: number;
     files: Awaited<ReturnType<typeof listPullRequestFiles>> | null;
+    convergedRepoAllowed?: boolean | undefined;
   },
 ): Promise<void> {
+  const convergedRepoAllowed = args.convergedRepoAllowed ?? isConvergenceRepoAllowed(env, args.repoFullName);
   // Per-repo cutover gate (GITTENSORY_REVIEW_REPOS): the secret-leak scan activates for THIS repo only when
   // it is allowlisted AND the global safety flag is ON. Empty/unset allowlist → no-op for every repo (the
   // advisory is byte-identical to today) regardless of GITTENSORY_REVIEW_SAFETY.
-  if (!isSafetyEnabled(env) || !isConvergenceRepoAllowed(env, args.repoFullName)) return;
+  if (!isSafetyEnabled(env) || !convergedRepoAllowed) return;
   try {
     const files = args.files ?? (await listPullRequestFiles(env, args.repoFullName, args.pullNumber));
     const finding = secretLeakFinding(buildAiReviewDiff(files));
@@ -1797,11 +1798,8 @@ async function maybePublishPrPublicSurface(
   webhook: { deliveryId: string; authorType?: string | undefined; action?: string | undefined; previewPollAttempt?: number | undefined },
 ): Promise<ReturnType<typeof evaluateGateCheck> | undefined> {
   const author = pr.authorLogin ?? null;
-  // Per-repo cutover gate (GITTENSORY_REVIEW_REPOS): the unified converged comment renders for THIS repo
-  // only when it is allowlisted AND the global GITTENSORY_REVIEW_UNIFIED_COMMENT flag is ON. Computed once and ANDed into
-  // both unified-comment sites below (closed/skipped + open). Empty/unset allowlist → false → both sites keep
-  // the LEGACY panel byte-identical for every repo regardless of GITTENSORY_REVIEW_UNIFIED_COMMENT.
-  const unifiedCommentAllowed = isUnifiedReviewCommentEnabled(env) && isConvergenceRepoAllowed(env, repoFullName);
+  const convergedRepoAllowed = await isConvergenceRepoLive(env, repoFullName);
+  const unifiedCommentAllowed = isUnifiedReviewCommentEnabled(env) && convergedRepoAllowed;
   // `settings` is the EFFECTIVE config (`.gittensory.yml` > DB > defaults), resolved by the caller via
   // resolveRepositorySettings — so gate on/off and every blocker mode already reflect the repo's config
   // file. The gate only chooses what to do; confirmedContributor governs WHO can be blocked.
@@ -2016,6 +2014,7 @@ async function maybePublishPrPublicSurface(
       pr,
       author,
       confirmedContributor,
+      convergedRepoAllowed,
       ...(aiReviewWillRun ? { files: await getReviewFiles() } : {}),
     });
 
@@ -2024,12 +2023,13 @@ async function maybePublishPrPublicSurface(
     // (safety flag ON + repo allowlisted), pass the shared resolved files so it scans the REAL diff (FIX B);
     // otherwise pass the already-loaded files (or null) and let the scan early-return. Flag-OFF (default) is an
     // immediate no-op → the advisory/gate is byte-identical.
-    const safetyWillRun = isSafetyEnabled(env) && isConvergenceRepoAllowed(env, repoFullName);
+    const safetyWillRun = isSafetyEnabled(env) && convergedRepoAllowed;
     await maybeAddSecretLeakFinding(env, {
       advisory,
       repoFullName,
       pullNumber: pr.number,
       files: safetyWillRun ? await getReviewFiles() : reviewFiles,
+      convergedRepoAllowed,
     });
 
     // First-time-contributor grace (#552): compute the author's complete per-repo PR history

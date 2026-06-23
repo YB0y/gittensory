@@ -155,10 +155,10 @@ declare global {
      *  the actual COMPARISON vs reviewbot's authoritative decisions needs reviewbot's rows in the SAME table,
      *  written by the deploy-time dual-run shadow step (out of scope here). See src/review/parity-wire.ts. */
     GITTENSORY_REVIEW_PARITY_AUDIT?: string;
-    /** Convergence (cutover): comma-separated allowlist of repo full-names ("owner/repo") that may run the
-     *  PER-PR converged review features (safety defang + secret-leak, grounding, RAG, reputation AI-skip/record,
-     *  unified comment). A feature activates for a repo ONLY IF its existing global flag is ON AND the repo is
-     *  in this allowlist — letting the cutover roll forward (or back) one repo at a time. Matching is
+    /** Convergence (cutover): comma-separated allowlist of repo full-names ("owner/repo") that may be considered
+     *  for PER-PR converged review features (safety defang + secret-leak, grounding, RAG, reputation AI-skip/record,
+     *  unified comment). Live activation additionally requires the internal cutover control row to be promoted
+     *  to `stage='live'` after parity, freeze verification, and rollback dry-run have passed. Matching is
      *  case-insensitive on the trimmed "owner/repo". Default "" (unset/empty/whitespace) → NO repos → every
      *  per-PR converged feature stays OFF for ALL repos regardless of the global flags (byte-identical dormant
      *  deploy). The cron/endpoint flags (ops / selftune / parity / content-lane / draft) are NOT scoped by

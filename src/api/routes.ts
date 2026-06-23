@@ -6,6 +6,15 @@ import { enforceRateLimit, routeClassForPath } from "../auth/rate-limit";
 import { handleShot } from "../review/visual/shot";
 import { isScreenshotsEnabled } from "../review/visual-wire";
 import {
+  activateReviewCutoverLive,
+  CutoverTransitionError,
+  getReviewCutoverStatus,
+  listReviewCutoverStatuses,
+  markReviewCutoverFreezeVerified,
+  markReviewCutoverRollbackDryRun,
+  rollbackReviewCutoverToShadow,
+} from "../review/cutover-control";
+import {
   BROWSER_SESSION_COOKIE,
   GITHUB_OAUTH_STATE_COOKIE,
   authenticateInternalToken,
@@ -2882,6 +2891,38 @@ export function createApp() {
   app.get("/v1/internal/parity", async (c) => {
     if (!isParityAuditEnabled(c.env)) return c.json({ error: "not_found" }, 404);
     return c.json(await computeParityReadiness(c.env));
+  });
+
+  app.get("/v1/internal/cutover", async (c) => {
+    const repo = c.req.query("repo");
+    return c.json(repo ? await getReviewCutoverStatus(c.env, repo) : await listReviewCutoverStatuses(c.env));
+  });
+
+  app.post("/v1/internal/cutover/repos/:owner/:repo", async (c) => {
+    const repoFullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
+    const body = await c.req.json().catch(() => ({}));
+    const actor = typeof body?.actor === "string" && body.actor.trim() ? body.actor.trim() : null;
+    switch (body?.action) {
+      case "verify_freeze":
+        await markReviewCutoverFreezeVerified(c.env, repoFullName, actor);
+        return c.json(await getReviewCutoverStatus(c.env, repoFullName));
+      case "record_rollback_dry_run":
+        await markReviewCutoverRollbackDryRun(c.env, repoFullName, actor);
+        return c.json(await getReviewCutoverStatus(c.env, repoFullName));
+      case "activate_live":
+        try {
+          return c.json(await activateReviewCutoverLive(c.env, repoFullName));
+        } catch (error) {
+          if (error instanceof CutoverTransitionError) {
+            return c.json({ error: "cutover_transition_blocked", blockers: error.blockers, status: await getReviewCutoverStatus(c.env, repoFullName) }, 409);
+          }
+          throw error;
+        }
+      case "rollback_to_shadow":
+        return c.json(await rollbackReviewCutoverToShadow(c.env, repoFullName));
+      default:
+        return c.json({ error: "valid_action_required" }, 400);
+    }
   });
 
   app.post("/v1/internal/jobs/refresh-registry", async (c) => {
